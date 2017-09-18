@@ -1718,7 +1718,7 @@ static void *cm_rtpbcast_handler(void *data) {
 	}
 	json_t *root = NULL;
 	while(g_atomic_int_get(&initialized) && !g_atomic_int_get(&stopping)) {
-		if(!messages || (msg = g_async_queue_try_pop(messages)) == NULL) {
+		if(!messages || (msg = g_async_queue_pop(messages)) == NULL) {
 			usleep(50000);
 			continue;
 		}
