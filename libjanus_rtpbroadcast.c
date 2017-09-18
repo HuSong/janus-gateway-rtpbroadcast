@@ -165,7 +165,8 @@ const char *cm_rtpbcast_get_name(void);
 const char *cm_rtpbcast_get_author(void);
 const char *cm_rtpbcast_get_package(void);
 void cm_rtpbcast_create_session(janus_plugin_session *handle, int *error);
-struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *handle, char *transaction, char *message, char *sdp_type, char *sdp);
+//struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *handle, char *transaction, char *message, char *sdp_type, char *sdp);
+struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *handle, char *transaction, json_t *message, json_t *jsep);
 void cm_rtpbcast_setup_media(janus_plugin_session *handle);
 void cm_rtpbcast_incoming_rtp(janus_plugin_session *handle, int video, char *buf, int len);
 void cm_rtpbcast_incoming_rtcp(janus_plugin_session *handle, int video, char *buf, int len);
@@ -444,8 +445,7 @@ typedef struct cm_rtpbcast_message {
 	janus_plugin_session *handle;
 	char *transaction;
 	json_t *message;
-	char *sdp_type;
-	char *sdp;
+	json_t *jsep;
 } cm_rtpbcast_message;
 static GAsyncQueue *messages = NULL;
 
@@ -461,10 +461,9 @@ void cm_rtpbcast_message_free(cm_rtpbcast_message *msg) {
 	if(msg->message)
 		json_decref(msg->message);
 	msg->message = NULL;
-	g_free(msg->sdp_type);
-	msg->sdp_type = NULL;
-	g_free(msg->sdp);
-	msg->sdp = NULL;
+	if(msg->jsep)
+		json_decref(msg->jsep);
+	msg->jsep = NULL;
 
 	g_free(msg);
 }
@@ -691,7 +690,7 @@ void *cm_rtpbcast_watchdog(void *data) {
 
 						json_object_set_new(event, "result", result);
 						char *event_text = json_dumps(event, JSON_INDENT(3) | JSON_PRESERVE_ORDER);
-						gateway->push_event(session->handle, &cm_rtpbcast_plugin, NULL, event_text, NULL);
+						gateway->push_event(session->handle, &cm_rtpbcast_plugin, NULL, event, NULL);
 					}
 				}
 			}
@@ -1143,14 +1142,14 @@ char *cm_rtpbcast_query_session(janus_plugin_session *handle) {
 	return info_text;
 }
 
-struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *handle, char *transaction, char *message, char *sdp_type, char *sdp) {
+struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *handle, char *transaction, json_t *message, json_t *jsep) {
 	if(g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
 		return janus_plugin_result_new(JANUS_PLUGIN_ERROR, g_atomic_int_get(&stopping) ? "Shutting down" : "Plugin not initialized", NULL);
 
 	/* Pre-parse the message */
 	int error_code = 0;
 	char error_cause[512];
-	json_t *root = NULL;
+	json_t *root = message;
 	json_t *response = NULL;
 
 	/* This might need to be freed at error: label */
@@ -1162,7 +1161,6 @@ struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *han
 		g_snprintf(error_cause, 512, "%s", "No message??");
 		goto error;
 	}
-	JANUS_LOG(LOG_VERB, "Handling message: %s\n", message);
 
 	cm_rtpbcast_session *session = (cm_rtpbcast_session *)handle->plugin_handle;
 	if(!session) {
@@ -1178,7 +1176,7 @@ struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *han
 		goto error;
 	}
 	json_error_t error;
-	root = json_loads(message, 0, &error);
+	//root = json_loads(message, 0, &error);
 	if(!root) {
 		JANUS_LOG(LOG_ERR, "JSON error: on line %d: %s\n", error.line, error.text);
 		error_code = CM_RTPBCAST_ERROR_INVALID_JSON;
@@ -1521,8 +1519,7 @@ struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *han
 		msg->handle = handle;
 		msg->transaction = transaction;
 		msg->message = root;
-		msg->sdp_type = sdp_type;
-		msg->sdp = sdp;
+		msg->jsep = jsep;
 
 		g_async_queue_push(messages, msg);
 
@@ -1536,25 +1533,34 @@ struct janus_plugin_result *cm_rtpbcast_handle_message(janus_plugin_session *han
 
 plugin_response:
 		{
-			if(!response) {
+			if(error_code == 0 && !response) {
 				error_code = CM_RTPBCAST_ERROR_UNKNOWN_ERROR;
 				g_snprintf(error_cause, 512, "Invalid response");
-				goto error;
 			}
+			if(error_code != 0) {
+				/* Prepare JSON error event */
+				json_t *event = json_object();
+				json_object_set_new(event, "streaming", json_string("event"));
+				json_object_set_new(event, "error_code", json_integer(error_code));
+				json_object_set_new(event, "error", json_string(error_cause));
+				response = event;
+			}
+
 			if(root != NULL)
 				json_decref(root);
-			g_free(transaction);
-			g_free(message);
-			g_free(sdp_type);
-			g_free(sdp);
+
+			if(jsep != NULL)
+				g_free(jsep);
 
 			if (sources != NULL)
 				g_array_free(sources, TRUE);
 
-			char *response_text = json_dumps(response, JSON_INDENT(3) | JSON_PRESERVE_ORDER);
-			json_decref(response);
-			janus_plugin_result *result = janus_plugin_result_new(JANUS_PLUGIN_OK, NULL, response_text);
-			g_free(response_text);
+			g_free(transaction);
+			// g_free(message);
+			// char *response_text = json_dumps(response, JSON_INDENT(3) | JSON_PRESERVE_ORDER);
+			// json_decref(response);
+			janus_plugin_result *result = janus_plugin_result_new(JANUS_PLUGIN_OK, NULL, response);
+			// g_free(response_text);
 			return result;
 		}
 
@@ -1564,8 +1570,7 @@ error:
 				json_decref(root);
 			g_free(transaction);
 			g_free(message);
-			g_free(sdp_type);
-			g_free(sdp);
+			g_free(jsep);
 
 			if (sources != NULL)
 				g_array_free(sources, TRUE);
@@ -1577,7 +1582,7 @@ error:
 			json_object_set_new(event, "error", json_string(error_cause));
 			char *event_text = json_dumps(event, JSON_INDENT(3) | JSON_PRESERVE_ORDER);
 			json_decref(event);
-			janus_plugin_result *result = janus_plugin_result_new(JANUS_PLUGIN_OK, NULL, event_text);
+			janus_plugin_result *result = janus_plugin_result_new(JANUS_PLUGIN_OK, NULL, event);
 			g_free(event_text);
 			return result;
 		}
@@ -1609,7 +1614,7 @@ void cm_rtpbcast_setup_media(janus_plugin_session *handle) {
 	char *event_text = json_dumps(event, JSON_INDENT(3) | JSON_PRESERVE_ORDER);
 	json_decref(event);
 	JANUS_LOG(LOG_VERB, "Pushing event: %s\n", event_text);
-	int ret = gateway->push_event(handle, &cm_rtpbcast_plugin, NULL, event_text, NULL);
+	int ret = gateway->push_event(handle, &cm_rtpbcast_plugin, NULL, event, NULL);
 	JANUS_LOG(LOG_VERB, "  >> %d (%s)\n", ret, janus_get_api_error(ret));
 	g_free(event_text);
 }
@@ -1697,8 +1702,7 @@ void cm_rtpbcast_hangup_media(janus_plugin_session *handle) {
 	msg->handle = handle;
 	msg->message = json_loads("{\"request\":\"stop\"}", 0, NULL);
 	msg->transaction = NULL;
-	msg->sdp_type = NULL;
-	msg->sdp = NULL;
+	msg->jsep = NULL;
 	g_async_queue_push(messages, msg);
 }
 
@@ -2136,8 +2140,10 @@ static void *cm_rtpbcast_handler(void *data) {
 		}
 
 		/* Any SDP to handle? */
-		if(msg->sdp) {
-			JANUS_LOG(LOG_VERB, "This is involving a negotiation (%s) as well (but we really don't care):\n%s\n", msg->sdp_type, msg->sdp);
+		const char *msg_sdp_type = json_string_value(json_object_get(msg->jsep, "type"));
+		const char *msg_sdp = json_string_value(json_object_get(msg->jsep, "sdp"));
+		if(msg_sdp) {
+			JANUS_LOG(LOG_VERB, "This is involving a negotiation (%s) as well (but we really don't care):\n%s\n", msg_sdp_type, msg_sdp);
 		}
 
 		/* Prepare JSON event */
@@ -2148,7 +2154,8 @@ static void *cm_rtpbcast_handler(void *data) {
 		char *event_text = json_dumps(event, JSON_INDENT(3) | JSON_PRESERVE_ORDER);
 		json_decref(event);
 		JANUS_LOG(LOG_VERB, "Pushing event: %s\n", event_text);
-		int ret = gateway->push_event(msg->handle, &cm_rtpbcast_plugin, msg->transaction, event_text, sdp);
+		json_t *jsep = json_pack("{ssss}", "type", sdp_type, "sdp", sdp);
+		int ret = gateway->push_event(msg->handle, &cm_rtpbcast_plugin, msg->transaction, event, jsep);
 		JANUS_LOG(LOG_VERB, "  >> %d (%s)\n", ret, janus_get_api_error(ret));
 		g_free(event_text);
 		if(sdp)
@@ -2166,7 +2173,7 @@ error:
 			char *event_text = json_dumps(event, JSON_INDENT(3) | JSON_PRESERVE_ORDER);
 			json_decref(event);
 			JANUS_LOG(LOG_VERB, "Pushing event: %s\n", event_text);
-			int ret = gateway->push_event(msg->handle, &cm_rtpbcast_plugin, msg->transaction, event_text, NULL);
+			int ret = gateway->push_event(msg->handle, &cm_rtpbcast_plugin, msg->transaction, event, NULL);
 			JANUS_LOG(LOG_VERB, "  >> %d (%s)\n", ret, janus_get_api_error(ret));
 			g_free(event_text);
 			cm_rtpbcast_message_free(msg);
@@ -3392,7 +3399,7 @@ void cm_rtpbcast_mountpoint_destroy(gpointer data, gpointer user_data) {
 				if (session->source) {
 					session->source = NULL;
 					/* Tell the core to tear down the PeerConnection, hangup_media will do the rest */
-					gateway->push_event(session->handle, &cm_rtpbcast_plugin, NULL, event_text, NULL);
+					gateway->push_event(session->handle, &cm_rtpbcast_plugin, NULL, event, NULL);
 					gateway->close_pc(session->handle);
 				}
 				/* If the session was a repeater. Note this removes session from listeners so
@@ -3445,7 +3452,7 @@ void cm_rtpbcast_notify_session(gpointer data, gpointer user_data) {
 
 	char *event_text = json_dumps(event, JSON_INDENT(3) | JSON_PRESERVE_ORDER);
 	JANUS_LOG(LOG_VERB, "Pushing event: %s\n", event_text);
-	int ret = gateway->push_event(session->handle, &cm_rtpbcast_plugin, NULL, event_text, NULL);
+	int ret = gateway->push_event(session->handle, &cm_rtpbcast_plugin, NULL, event, NULL);
 	JANUS_LOG(LOG_VERB, "  >> %d (%s)\n", ret, janus_get_api_error(ret));
 	g_free(event_text);
 }
@@ -3557,7 +3564,7 @@ static void cm_rtpbcast_execute_switching(gpointer data, gpointer user_data) {
 		char *event_text = json_dumps(event, JSON_INDENT(3) | JSON_PRESERVE_ORDER);
 		json_decref(event);
 
-		gateway->push_event(sessid->handle, &cm_rtpbcast_plugin, NULL, event_text, NULL);
+		gateway->push_event(sessid->handle, &cm_rtpbcast_plugin, NULL, event, NULL);
 		janus_mutex_unlock(&oldsrc->mutex);
 	}
 	janus_mutex_unlock(&sessid->mutex);
